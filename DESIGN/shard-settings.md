@@ -155,18 +155,7 @@ Additional shards increment by 10 again (4021/4022/4026, etc.). `AMP_PORT` is Ev
 
 ## Localhost multi-instance game directories
 
-Evennia uses PID files (`server.pid`, `portal.pid`) to track running processes. These live in `server/` inside the game directory. Running two instances from the same directory fails because the second sees the first's PID file.
-
-The demo examples solve this with symlinked game directories. `demo_shard0` is the "real" game directory containing all game code, settings, and the shared database. `demo_router` and `demo_shard1` are lightweight directories that symlink to `demo_shard0`'s code but have their own `server/` directory for PID files and logs.
-
-```
-examples/
-  demo_shard0/          <- real game dir (code, settings, shared DB)
-  demo_router/          <- symlinks to demo_shard0, own server/ for PIDs
-  demo_shard1/          <- symlinks to demo_shard0, own server/ for PIDs
-```
-
-All instances share the same database via a `DATABASES` override in `settings_common_shard_config.py` that uses `os.path.realpath(__file__)` to always resolve to `demo_shard0/server/evennia.db3`, regardless of symlinks. See `examples/README.md` for setup and usage instructions.
+The recipe for running multiple roles locally differs by OS (Windows runs all roles from one gamedir; Unix needs symlinked view gamedirs to avoid PID-file collisions). See [deployment-topology.md § Local development](deployment-topology.md#local-development) for the full explanation and the canonical recipes.
 
 ## What this design doesn't address
 

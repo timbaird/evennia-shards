@@ -11,7 +11,7 @@ For the design wiki, read [DESIGN/INDEX.md](DESIGN/INDEX.md).
 
 ## Project status
 
-**Working MVP, not production-ready.** The four shard-isolation chokepoints, ticket-based WebSocket auth, cross-shard character + inventory move, chargen wrapper, and primitive cross-shard messaging (`obj_msg` / `account_msg`) are all shipped and live-smoke-verified end-to-end against three demo gamedirs. The original PoC phasing in the [archived handover](DESIGN/archive/evennia-shards-HANDOVER.md#phased-poc-plan) is historical context; for the current state read [DESIGN/progress.md](DESIGN/progress.md), which is the running log of milestones with links to evidence (test results, design docs, code changes). The library has not yet been exercised by a real consumer game.
+**Working MVP, not production-ready.** Shard partition enforcement (django-multitenant auto-filter on `ObjectDB`), ticket-based WebSocket auth, cross-shard character + inventory move, chargen wrapper, cross-shard `@tel`, and primitive cross-shard messaging (`obj_msg` / `account_msg` / `room_msg`) are all shipped and live-smoke-verified end-to-end against three demo gamedirs. For the current state read [DESIGN/progress.md](DESIGN/progress.md). The library has not yet been exercised by a real consumer game.
 
 ## Where to read first
 
@@ -28,7 +28,7 @@ These are the principles every implementation decision must respect. They are re
 
 1. **Default to "library does nothing" in `monolith` mode.** Any feature must justify its presence in monolith. Gate it on `SHARDS_ROLE != "monolith"` if it doesn't add value there.
 2. **Branch at registration time, not per call.** Don't register the override in monolith mode in the first place. Per-call branching is acceptable only when registration-time branching is genuinely impossible.
-3. **The library does not own game concepts.** Rooms, characters, zones, items belong to the consumer game. The library provides infrastructure (ticket system, redirect protocol, handoff lifecycle, isolation chokepoints, cross-shard message bus, sender-side helpers). When tempted to add a game concept, ask whether it's actually game-specific and should stay in the consumer.
+3. **The library does not own game concepts.** Rooms, characters, zones, items belong to the consumer game. The library provides infrastructure (ticket system, redirect protocol, handoff lifecycle, tenancy enforcement via django-multitenant, cross-shard message bus, sender-side helpers). When tempted to add a game concept, ask whether it's actually game-specific and should stay in the consumer.
 4. **No FCM-specific assumptions.** This library was extracted from work on FullCircleMUD (FCM). Anything FCM-specific creeping into the library is a code smell. Zone names, economy concepts, NFT references, FCM-specific typeclass names — all stay in FCM. Default to "consumer concern" when uncertain.
 5. **Cache invariant by construction, not discipline.** Use `.values()` queries, mode-specific code registration, and clear ownership boundaries. Don't rely on developers remembering not to cache things.
 6. **Web-first.** Telnet support is a deliberate post-PoC concern.

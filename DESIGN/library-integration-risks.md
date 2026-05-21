@@ -50,11 +50,11 @@ The hazard is a consumer overriding `onOpen()` on their custom class without cal
 **What we patch / extend:** `evennia/accounts/accounts.py` → `DefaultAccount.at_post_login`. Two role-specific patches, both installed via monkey-patch in `AppConfig.ready()`. Based on Evennia 6.0.0.
 
 - **Router** (`get_role() == ROLE_ROUTER`): full replacement → `evennia_shards/hooks.py` → `shard_aware_at_post_login`.
-- **Shard** (`get_role() == ROLE_SHARD`): thin wrapper around Evennia's original → `evennia_shards/hooks.py` → `make_shard_at_post_login(original)`. Flushes the `_last_puppet` character from the idmapper and refreshes it from the DB before delegating to the original. Needed because `cross_shard_character_move` on the source shard updates the character's `shard_id` in the DB, but the destination shard's Account Attribute-handler cache may still hold the stale Python object with the old `shard_id` — causing `puppet_object` to trip the `pre_save` chokepoint.
+- **Shard** (`get_role() == ROLE_SHARD`): thin wrapper around Evennia's original → `evennia_shards/hooks.py` → `make_shard_at_post_login(original)`. Flushes the `_last_puppet` character from the idmapper and gates `refresh_from_db` behind an explicit `ObjectDB.objects.filter(pk).exists()` check (the auto-filter; `refresh_from_db` itself routes through `_base_manager` and would bypass it). If the row is no longer visible from this shard (moved or deleted), `_last_puppet` is cleared so vanilla falls through to the OOC menu instead of crashing on `puppet_object`.
 
 **Why:**
 
-When `AUTO_PUPPET_ON_LOGIN = True` (Evennia's default), `at_post_login` calls `puppet_object(session, self.db._last_puppet)` directly, with no exposed seam between the function's prelude (protocol-flag load, `logged_in` OOB, connect-channel msg) and the if/else that decides whether to puppet. On a router this is doubly broken: `_last_puppet=None` raises and the player sees `"The Character does not exist."`; `_last_puppet=<character on shardN>` puppets the character on the *router* (chokepoint-exempt for reads) and the next save raises `ShardIsolationError`.
+When `AUTO_PUPPET_ON_LOGIN = True` (Evennia's default), `at_post_login` calls `puppet_object(session, self.db._last_puppet)` directly, with no exposed seam between the function's prelude (protocol-flag load, `logged_in` OOB, connect-channel msg) and the if/else that decides whether to puppet. On a router this is doubly broken: `_last_puppet=None` raises and the player sees `"The Character does not exist."`; `_last_puppet=<character on shardN>` puppets the character on the *router* — which is structurally wrong (characters live on shards) and the subsequent save would land the character row on the router's identity.
 
 The library needs to make a routing decision (redirect-to-shard vs render OOC menu) at exactly the position where Evennia's if/else lives. Three alternatives were considered and rejected:
 
@@ -75,7 +75,7 @@ How to check: diff upstream `DefaultAccount.at_post_login` against the snapshot 
 
 **Risk in consumer override:**
 
-A consumer that subclasses `DefaultAccount` and overrides `at_post_login` without calling `super().at_post_login(...)` will bypass our patch — the consumer's body runs instead. On the router, auto-puppet redirect stops working. On shards, the cache-busting preamble is skipped and cross-shard moves back to a previously-visited shard will trip the `pre_save` chokepoint. Recommended pattern: any consumer override of `at_post_login` must call `super().at_post_login(session=session, **kwargs)` (or accept that these behaviours will not run on their accounts).
+A consumer that subclasses `DefaultAccount` and overrides `at_post_login` without calling `super().at_post_login(...)` will bypass our patch — the consumer's body runs instead. On the router, auto-puppet redirect stops working. On shards, the cache-busting preamble is skipped and a `_last_puppet` that's been moved off this shard will crash the puppet step instead of falling through to the OOC menu. Recommended pattern: any consumer override of `at_post_login` must call `super().at_post_login(session=session, **kwargs)` (or accept that these behaviours will not run on their accounts).
 
 A consumer that *doesn't* override `at_post_login` is safe by Python MRO — `account.at_post_login(...)` resolves to our patched `DefaultAccount.at_post_login` automatically.
 
@@ -93,11 +93,11 @@ A consumer that *doesn't* override `at_post_login` is safe by Python MRO — `ac
 
 **Why:**
 
-`Account.create_character` is the converging seam for all chargen paths — `CmdCharCreate`, `AUTO_CREATE_CHARACTER_WITH_ACCOUNT`, and the guest path all funnel through it. It runs on the router (chargen is an OOC operation; the player's session lives on the router while OOC). Without intervention, the new row is auto-stamped by `pre_save` with `current = get_shard_id() = "router"`, which is not a member of `SHARD_URLS` — so `ShardAwareCmdIC` and the `at_post_login` auto-puppet path cannot redirect the player to any shard.
+`Account.create_character` is the converging seam for all chargen paths — `CmdCharCreate`, `AUTO_CREATE_CHARACTER_WITH_ACCOUNT`, and the guest path all funnel through it. It runs on the router (chargen is an OOC operation; the player's session lives on the router while OOC). The router runs unscoped under the multitenant integration, so the auto-stamp on insert is skipped and the new row lands with `shard_id=NULL` — not in `SHARD_URLS`, so `ShardAwareCmdIC` and the `at_post_login` auto-puppet path cannot redirect the player to any shard.
 
-The wrapper calls vanilla unmodified, then reads the new character's `db_location_id`'s `shard_id` via `.values_list` and overwrites the router auto-stamp. The character's shard is by definition the shard that owns its location row — there is no separate policy decision. The two `save()`s (vanilla's plus the wrapper's `update_fields=["shard_id"]`) are both router-side, exempt from the foreign-shard refusal in `pre_save`, so no bypass is needed.
+The wrapper calls vanilla unmodified, then reads the new character's `db_location_id`'s `shard_id` via `.values_list` and stamps the character to match. The character's shard is by definition the shard that owns its location row — there is no separate policy decision. The post-create assignment-then-save lands without a bypass: the row's `shard_id` is `NULL` so the `__setattr__` immutability check passes through, and the router being unscoped means `_do_update` applies no extra tenant filter.
 
-`DEFAULT_HOME` is not touched at chargen time — vanilla `create_character` does not set `db_home`, and any later cross-shard home transfer is a runtime move handled by `cross_shard_character_move`.
+`DEFAULT_HOME` is not touched at chargen time — vanilla `create_character` does not set `db_home`, and any later cross-shard home transfer is a runtime move handled by `cross_shard_move`.
 
 **Risk on Evennia upgrade:**
 
@@ -111,7 +111,7 @@ How to check: diff upstream `Account.create_character` (and `DefaultGuest.authen
 
 A consumer that subclasses `DefaultAccount` and overrides `create_character` is **safe by construction**: the wrapper is installed on the configured `BASE_ACCOUNT_TYPECLASS` and reads `AccountCls.create_character` at install time, so MRO picks up either the consumer's override or the inherited `DefaultAccount` method — whichever is in effect — and wraps that. The consumer's body runs first, then the stamp.
 
-The hazard is a consumer override that doesn't actually call `create.create_object` (or otherwise produces a character whose `db_location_id` is `None`). The wrapper logs a warning and leaves the character router-stamped; chargen succeeds but IC won't work. Recommended pattern: any consumer override should set `db_location` via the same `START_LOCATION` (or equivalent) source as vanilla.
+The hazard is a consumer override that doesn't actually call `create.create_object` (or otherwise produces a character whose `db_location_id` is `None`). The wrapper logs a warning and leaves `shard_id` as `NULL`; chargen succeeds but IC won't work. Recommended pattern: any consumer override should set `db_location` via the same `START_LOCATION` (or equivalent) source as vanilla.
 
 A consumer who points `BASE_ACCOUNT_TYPECLASS` at a class that doesn't derive from `DefaultAccount` would not have `create_character` at all; the wrapper install would fail at startup. This is symmetrical to other base-class assumptions in Evennia (locks, `_playable_characters`, etc.).
 
@@ -121,7 +121,7 @@ A consumer who points `BASE_ACCOUNT_TYPECLASS` at a class that doesn't derive fr
 
 **Why:**
 
-In sharded mode, `CmdIC` and `CmdOOC` *are* the cross-shard redirect mechanism — that's their entire job. `ShardAwareCmdIC.func` does not call `super().func()`; it implements the IC flow from scratch (resolve character → create ticket → emit `shard_redirect` OOB → close session). Vanilla `CmdIC.func` would puppet the character locally on the router, which is structurally wrong (characters live on shards, not the router) and would trip the chokepoints anyway. There is no compose-with-vanilla story: sharded IC isn't "vanilla IC plus some redirect logic," it's a different operation entirely. The same reasoning applies to `CmdOOC` on shards — going OOC from a shard means redirecting back to the router, not unpuppeting locally.
+In sharded mode, `CmdIC` and `CmdOOC` *are* the cross-shard redirect mechanism — that's their entire job. `ShardAwareCmdIC.func` does not call `super().func()`; it implements the IC flow from scratch (resolve character → create ticket → emit `shard_redirect` OOB → close session). Vanilla `CmdIC.func` would puppet the character locally on the router, which is structurally wrong (characters live on shards, not the router). There is no compose-with-vanilla story: sharded IC isn't "vanilla IC plus some redirect logic," it's a different operation entirely. The same reasoning applies to `CmdOOC` on shards — going OOC from a shard means redirecting back to the router, not unpuppeting locally.
 
 **Library territory, not a consumer extension point.**
 
@@ -140,6 +140,48 @@ The recommended posture is **don't subclass or replace IC/OOC in sharded deploym
 How to check: diff upstream `CmdIC.func` and `CmdOOC.func` bodies against what `ShardAwareCmdIC._resolve_character` reproduces; verify `AccountCmdSet` still references commands via module attribute (`from evennia.commands.default import account; account.CmdIC` or equivalent).
 
 **Risk in consumer override:** see "Library territory" above. If a consumer does subclass or replace these, behaviour is undefined — not because of a recoverable bug, but because the consumer is replacing infrastructure they don't own. The library does not detect this case at install time (unlike `at_post_login`); the recommendation is documentation only. Consumer subclasses can be detected by the same MRO walk we use for `at_post_login`, but the failure isn't recoverable via a documented `super()` pattern, so the warning would just say "don't do this" — easier to say it once in the docs than at every startup.
+
+## `CmdTeleport` — narrow override (delegate to vanilla when local)
+
+**What we patch / extend:** `evennia/commands/default/building.py` → `CmdTeleport`. Library code: `evennia_shards/teleport.py` → `ShardAwareCmdTeleport`. Installed via module-attribute swap on `building.CmdTeleport` — same shape as `CmdIC` / `CmdOOC` — but the swap is performed inside `_shards_wrapped_init` (the `evennia._init` wrap, see below) rather than at `AppConfig.ready()` time, because the `building.py` import chain pulls in `prototypes/menus` → `evmenu`, and `evmenu` subclasses `evennia.Command` at module load. `evennia.Command` is a lazy export populated by `evennia._init()`; importing `building` before `_init` runs raises `TypeError: NoneType takes no arguments`. The `_shards_wrapped_init` runs `_original_init` first, so the lazy exports are populated by the time we import `teleport.py`. Based on Evennia 6.0.0.
+
+**Why:**
+
+`CmdTeleport.parse` calls `caller.search(name, global_search=True)` up to three times to resolve `obj_to_teleport` and `destination`. On a shard process, that search routes through the auto-filtered `ObjectDB.objects` manager and silently sees only local + global rows — foreign-shard rooms are invisible to vanilla's lookup, so cross-shard `@tel` would fail with "Destination not found" even though the destination exists.
+
+The override has a narrow design: stay close to vanilla. The class subclasses `CmdTeleport`. `parse()` mirrors vanilla's structure 1:1, substituting the three `caller.search` calls with [`shard_aware_global_search`](shard-aware-search.md) (which returns either a loaded instance for a local match or pk + shard_id for a foreign match). `func()` dispatches into three branches:
+
+1. **`/tonone`** — vanilla logic if `obj_to_teleport` is local. If foreign, refuse with a pointer to the "teleport yourself to that shard first, then run /tonone locally" workflow.
+2. **Both local** — delegate to vanilla `super().func()` unchanged. All vanilla behaviour (lock checks, equality checks, `/loc` / `/intoexit` / `/quiet`, the move itself, announce messages, failure paths) runs untouched. This is the common case.
+3. **Cross-shard** — route via the library's `cross_shard_move` primitive when the destination is foreign and the object is local. (The foreign-object case is refused with the same "teleport yourself across first" pointer; supporting it would require a remote-execute primitive the library does not currently provide.)
+
+The branch where both targets are local — by far the common case in practice — runs vanilla code verbatim. The cross-shard branch wraps an existing library primitive. The structure imitates rather than reimplements; the override surface area is minimal.
+
+Two small vanilla alignments live in the cross-shard branch itself, both aimed at making the user-visible behaviour match vanilla wherever it's cheap:
+
+- **Multi-match disambiguation prompt.** When `shard_aware_global_search` returns `state="multiple"`, the override renders the candidate list (`#5 (Tavern, shard0), #12 (Tavern, shard1) - specify by dbref.`) and raises `InterruptCommand`. The user gets actionable information instead of a generic "ambiguous" refusal.
+- **Same-position short-circuit.** Before calling the `cross_shard_move` primitive, the override checks `obj.db_location_id == dest_pk`. If they match, the obj is already in the destination room — pks are globally unique under the [single-Postgres bound](library-scope-and-mandates.md), so the pk match is equivalent to vanilla's `obj.location == destination` instance comparison. Emits vanilla's `"<obj> is already at <dest>."` and returns without bus traffic.
+- **Obj-side `teleport` lock check.** Before calling `cross_shard_move`, the override mirrors vanilla's `caller.permissions.check("Admin") or obj.access(caller, "teleport")` short-circuit ([building.py:3922](https://github.com/evennia/evennia/blob/main/evennia/commands/default/building.py)). Without it, a `teleport`-locked obj would be teleportable cross-shard despite vanilla refusing the same op locally — a security inconsistency. The destination-side `teleport_here` lock is **not** checked here: the destination row lives on the foreign shard and there's no local way to evaluate its lock against the obj. That requires a bus round-trip and is deferred.
+- **Leave / arrive announces.** Cross-shard movement bypasses Evennia's `move_to`, so the vanilla `announce_move_from` / `announce_move_to` hooks would silently drop. The override fires the announces explicitly: source-side via local `source.msg_contents(...)` synchronously before the move (source room is local in this branch, so this is a plain `msg_contents` call); destination-side via `send_cross_shard_room_message` after the move, routing through the bus's [`room_msg`](cross-shard-message-bus.md) kind. The destination-side announce text is composed on the source side (the only side with both `obj.key` and `source.key` available locally) and shipped in the bus payload; receiver renders verbatim. Both announces are gated on `/quiet`, matching vanilla. Caller-facing confirmation is NOT gated on `/quiet` (vanilla emits it unconditionally — `/quiet` is documented as suppressing room announces only).
+
+Name-resolution coverage in the helper itself ([shard-aware-search.md](shard-aware-search.md)) — dbref, exact key, alias, `me`/`self`/`here` — matches vanilla `caller.search(global_search=True)` for everything except fuzzy / partial name matching.
+
+**Risk on Evennia upgrade:**
+
+- Changes to `CmdTeleport.parse`'s structure — currently three discrete `caller.search` calls organised under `if self.rhs / elif self.lhs`. Our parse mirrors this exact branching. If vanilla refactors parse (e.g. moves to a helper, adds a fourth lookup, changes the rhs vs no-rhs distinction), our parse needs the same refactor.
+- Changes to `CmdTeleport`'s parent class. Currently `COMMAND_DEFAULT_CLASS` (typically `MuxCommand`), which is where the `lhs` / `rhs` splitting via `rhs_split` lives. Our override calls `super(CmdTeleport, self).parse()` explicitly to reach this parent, skipping vanilla `CmdTeleport.parse`'s body. If the parent changes — or if the `rhs_split` mechanism moves — that call site needs updating.
+- New switches added to `CmdTeleport` — `/quiet`, `/intoexit`, `/tonone`, `/loc` today. Our dispatch enumerates the relevant ones (`/tonone` short-circuits) and delegates the others to vanilla. A new switch that interacts with cross-shard semantics would need explicit handling in our dispatch.
+- Changes to where `CharacterCmdSet` looks up `CmdTeleport` — currently `building.CmdTeleport()` via module attribute (see `evennia/commands/default/cmdset_character.py`). The module-attribute swap pattern relies on this. If Evennia changes the cmdset to bind `CmdTeleport` at import time, the swap stops being seen and we'd need a different patch shape.
+
+How to check: diff upstream `CmdTeleport.parse` and `CmdTeleport.func` against our override on Evennia bump. The relevant cmdset references are in `cmdset_character.py`.
+
+**Risk in consumer override:**
+
+A consumer who subclasses `CmdTeleport` to add custom teleport behaviour (audit logging, restricted-target rules, narrative beats) needs to be aware of the swap: by the time `CharacterCmdSet.at_cmdset_creation` runs, `building.CmdTeleport` points at `ShardAwareCmdTeleport`, so a consumer subclass picks that up via MRO automatically — gaining shard-awareness for free.
+
+A consumer who binds `CmdTeleport` at import time (`from evennia.commands.default.building import CmdTeleport` at the top of their module, used as a base class for a custom subclass) may snapshot vanilla `CmdTeleport` before our swap runs. The result: their subclass extends vanilla, the cross-shard safety is bypassed. Recommended pattern: import the module, reference `building.CmdTeleport` at class-definition time (or define the subclass inside a function called at cmdset-creation time). The library does not detect this case at install time; the recommendation is documentation only.
+
+A consumer who replaces `CmdTeleport` entirely without subclassing the library version is replacing a piece of cross-shard infrastructure, and behaviour is undefined. Same posture as the `CmdIC` / `CmdOOC` "library territory" guidance above.
 
 ## `evennia._init()` wrap + `CharacterCmdSet.at_cmdset_creation` override
 

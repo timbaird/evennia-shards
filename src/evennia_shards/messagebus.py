@@ -98,6 +98,16 @@ class MessageHandler:
       for OOC delivery (tells, system messages, account-level channel
       msgs). Receiver looks up the account and calls
       `account.msg(**kwargs)`.
+    - `room_msg` — multicast variant: deliver text to every obj in a
+      room's contents on this shard. Payload is
+      `{"room_pk": <int>, "text": <str>, "exclude_pks": [<int>, ...]?,
+      "from_obj_pk": <int>?}`; receiver looks up the room and calls
+      `room.msg_contents(text, exclude=..., from_obj=...)`. Sender
+      composes the rendered text. Generic over use case — teleport
+      arrival announces, future cross-shard world events, system
+      messages — anywhere a foreign room needs to say something.
+    - `flush_from_cache` — evict pks from this shard's idmapper. See
+      the handler docstring for the cache-invariance use case.
 
     Consumers extend by subclassing:
 
@@ -122,6 +132,10 @@ class MessageHandler:
             return self._handle_obj_msg(message)
         if message.kind == "account_msg":
             return self._handle_account_msg(message)
+        if message.kind == "flush_from_cache":
+            return self._handle_flush_from_cache(message)
+        if message.kind == "room_msg":
+            return self._handle_room_msg(message)
         return False
 
     def _handle_ping(self, message) -> bool:
@@ -216,6 +230,123 @@ class MessageHandler:
             )
             return True
         account.msg(**kwargs)
+        return True
+
+    def _handle_flush_from_cache(self, message) -> bool:
+        """Evict pks from this process's ObjectDB idmapper.
+
+        Generic cache-invalidation primitive. The sender publishes
+        ``flush_from_cache`` with payload ``{"pks": [int, ...]}`` to
+        tell a peer shard "your in-process cached instances of these
+        rows are out of date; drop them so the next access reloads
+        from the DB."
+
+        Per-pk behaviour:
+
+        - pk is in this process's idmapper → call
+          ``instance.flush_from_cache(force=True)``, which removes
+          the Python instance from the cache. Next
+          ``ObjectDB.objects.get(pk=N)`` misses the cache, hits the
+          DB, and constructs a fresh instance. Per-instance state
+          (notably ``contents_cache``) is gone; lazy attributes
+          rebuild from current DB.
+        - pk is not currently cached → nothing to do, no-op.
+        - pk no longer exists in the DB → still nothing to do here;
+          the row's absence is the next caller's problem to handle.
+
+        The handler is idempotent: re-sending the same flush message
+        is harmless.
+
+        Primary current consumer: ``cross_shard_move`` sends the
+        destination room's pk so the destination shard re-reads the
+        room's contents on next access (otherwise the contents-cache
+        on a previously-loaded room misses the just-arrived object).
+        The primitive is deliberately generic — any cross-shard
+        mutation that other shards need to notice can publish here
+        without needing a new message kind.
+        """
+        from evennia.objects.models import ObjectDB
+
+        pks = message.payload.get("pks") or []
+        cache = ObjectDB.__dbclass__.__instance_cache__
+        for pk in pks:
+            instance = cache.get(pk)
+            if instance is not None:
+                instance.flush_from_cache(force=True)
+        return True
+
+    def _handle_room_msg(self, message) -> bool:
+        """Deliver a multicast message to a room's contents.
+
+        Resolves the room by pk and calls
+        ``room.msg_contents(text, exclude=..., from_obj=...)`` —
+        Evennia's own ``Object.msg_contents`` handles fanout to every
+        obj currently in the room's contents.
+
+        Payload shape:
+
+        - ``room_pk`` (int, required) — the target room.
+        - ``text`` (str, required) — the rendered text to broadcast.
+          Sender composes attribution and formatting; the bus is dumb.
+        - ``exclude_pks`` (list[int], optional) — pks to skip when
+          fanning out. Pks that don't resolve (deleted, on a yet-
+          another shard) are skipped silently — they're hints, not
+          the target.
+        - ``from_obj_pk`` (int, optional) — pk of the sender, looked
+          up locally and passed as ``from_obj`` for Evennia's
+          attribution machinery. Skipped silently if it doesn't
+          resolve.
+
+        Target-gone semantics: room missing → log warning, return
+        ``True`` (consumed). Matches ``_handle_obj_msg``.
+
+        Misroute safety: ``ObjectDB.objects.get(pk=room_pk)`` trips
+        the ``from_db`` chokepoint if the room is on another shard —
+        caught by ``process_inbox`` and treated as defer, eventually
+        triggering ``undeliverable_reply``. Loud failure on misroute
+        of the primary target. The optional pks are caught locally so
+        a stale hint can't time-bomb the whole message.
+
+        Primary current consumer: the ``ShardAwareCmdTeleport``
+        cross-shard branch publishes ``room_msg`` for arrival
+        announces on the destination room after ``cross_shard_move``
+        completes. The primitive is generic — any consumer needing to
+        broadcast to a foreign room (world events, system messages,
+        future cross-shard chat) can publish here without inventing a
+        new kind.
+        """
+        from evennia.objects.models import ObjectDB
+
+        pk = message.payload.get("room_pk")
+        text = message.payload.get("text")
+        try:
+            room = ObjectDB.objects.get(pk=pk)
+        except ObjectDB.DoesNotExist:
+            log.warning(
+                "room_msg: target ObjectDB pk=%r not found; dropping "
+                "(message pk=%s from %r)",
+                pk, message.pk, message.from_shard,
+            )
+            return True
+
+        exclude = []
+        for ex_pk in message.payload.get("exclude_pks") or []:
+            try:
+                exclude.append(ObjectDB.objects.get(pk=ex_pk))
+            except ObjectDB.DoesNotExist:
+                # Stale or misrouted hint — drop silently and proceed.
+                continue
+
+        from_obj = None
+        from_obj_pk = message.payload.get("from_obj_pk")
+        if from_obj_pk is not None:
+            try:
+                from_obj = ObjectDB.objects.get(pk=from_obj_pk)
+            except ObjectDB.DoesNotExist:
+                # Attribution lost but the message still goes.
+                from_obj = None
+
+        room.msg_contents(text, exclude=exclude, from_obj=from_obj)
         return True
 
 

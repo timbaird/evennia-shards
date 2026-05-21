@@ -14,7 +14,7 @@ A small, additive enhancement library. Three modes are selected per Evennia proc
 - **`router`** — auth front door. Owns `AccountDB`, runs login and the OOC menu, redirects players to a shard via single-use tickets on `@ic`.
 - **`shard`** — game world. Loads its slice of the world, accepts ticket-based session attaches from the router or other shards.
 
-The library does not impose its own room or character base classes — it provides infrastructure (chokepoints that enforce the per-row shard partition, cross-shard character move, ticket auth, message-bus primitives) and lets the consumer game keep its own typeclasses.
+The library does not impose its own room or character base classes — it provides infrastructure (per-row shard partition enforced via the [django-multitenant](https://github.com/citusdata/django-multitenant) auto-filter, cross-shard character move, ticket auth, message-bus primitives) and lets the consumer game keep its own typeclasses.
 
 ## What this is *not*
 

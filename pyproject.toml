@@ -12,6 +12,7 @@ authors = [{name = "Tim Baird"}]
 requires-python = ">=3.10"
 dependencies = [
     "evennia",
+    "django-multitenant",
 ]
 
 [tool.setuptools.packages.find]

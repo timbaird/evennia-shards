@@ -34,7 +34,7 @@ def _is_redirectable_character(character) -> bool:
     if character is None:
         return False
     # Router process may hold a stale row in the idmapper if another
-    # process moved this character (e.g. cross_shard_character_move updates
+    # process moved this character (e.g. cross_shard_move updates
     # shard_id and db_location_id together). Flush from the idmapper
     # cache first — Evennia's SharedMemoryModelBase.__call__ returns
     # the cached instance from from_db(), so refresh_from_db() is a
@@ -204,25 +204,36 @@ def warn_if_at_post_login_overridden(account_cls, role) -> bool:
 def make_shard_at_post_login(original_at_post_login):
     """Return a shard-side ``at_post_login`` that busts stale caches.
 
-    When a character is moved back to this shard by another process
-    (via ``cross_shard_character_move``), the Account's Attribute-handler
-    cache on *this* process may still hold the Python object from the
-    *outbound* move — with the old ``shard_id`` baked into its fields.
-    Evennia's default ``at_post_login`` reads ``_last_puppet`` from that
-    cache and hands the stale object straight to ``puppet_object``,
-    which tries to save it. The ``pre_save`` chokepoint then refuses
-    because it sees the old ``shard_id``.
+    The Account's Attribute-handler cache on this process can hold a
+    stale Python object for ``_last_puppet`` after another process has
+    moved the character's row (via ``cross_shard_move``, which writes
+    via ``qs.update`` and so doesn't go through this process's
+    idmapper). The wrapper flushes the cached Python object and
+    refreshes its fields from the DB before vanilla ``at_post_login``
+    reads ``_last_puppet`` and calls ``puppet_object`` on it.
 
-    This wrapper intercepts before the original fires, flushes the
-    character from the idmapper, and refreshes its fields from the DB
-    so ``puppet_object`` always works with the live row.
+    If the character's row is no longer owned by this shard
+    (cross-shard move while the account was offline) or has been
+    deleted, we null out ``_last_puppet`` so vanilla ``at_post_login``
+    falls through to the OOC menu instead of crashing on
+    ``puppet_object``. The visibility check uses ``ObjectDB.objects``
+    deliberately — that manager carries the tenant auto-filter, so
+    foreign rows return False from ``exists()``. Django's
+    ``refresh_from_db`` would bypass it (it routes through
+    ``_base_manager``, which is unfiltered), so we can't rely on it
+    to surface the foreign-row case on its own.
     """
 
     def shard_at_post_login(self, session=None, **kwargs):
+        from evennia.objects.models import ObjectDB
+
         character = self.db._last_puppet
         if character is not None and hasattr(character, "flush_from_cache"):
             character.flush_from_cache(force=True)
-            character.refresh_from_db()
+            if ObjectDB.objects.filter(pk=character.pk).exists():
+                character.refresh_from_db()
+            else:
+                self.db._last_puppet = None
         original_at_post_login(self, session=session, **kwargs)
 
     return shard_at_post_login

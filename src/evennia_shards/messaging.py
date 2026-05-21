@@ -77,14 +77,22 @@ def send_cross_shard_message(target_pk, kwargs, target_typeclass=None):
 
     from .config import get_shard_id
     from .messagebus import send_message
+    from .tenancy import shard_context
 
     if target_typeclass is None:
         target_typeclass = class_from_module(settings.BASE_CHARACTER_TYPECLASS)
 
-    rows = list(
-        ObjectDB.objects.filter(pk=target_pk)
-        .values_list("db_typeclass_path", "shard_id")[:1]
-    )
+    # Escape the multitenant auto-filter for the visibility lookup —
+    # if the target lives on a foreign shard, the auto-filter would
+    # exclude its row from values_list and the helper would falsely
+    # report "does not exist". Building the queryset inside the
+    # context block is the gating step (get_queryset reads the tenant
+    # at construction, not at execute). Same pattern as search.py.
+    with shard_context(None):
+        rows = list(
+            ObjectDB.objects.filter(pk=target_pk)
+            .values_list("db_typeclass_path", "shard_id")[:1]
+        )
     if not rows:
         log.warning(
             "send_cross_shard_message: target ObjectDB pk=%r does not "
@@ -118,6 +126,106 @@ def send_cross_shard_message(target_pk, kwargs, target_typeclass=None):
     send_message(
         kind="obj_msg",
         payload={"pk": target_pk, "kwargs": kwargs},
+        to_shard=target_shard,
+    )
+    return True
+
+
+def send_cross_shard_room_message(
+    room_pk, text, exclude_pks=None, from_obj_pk=None
+):
+    """Deliver ``text`` to every obj in a room's contents, locally or via bus.
+
+    Sender-side helper that wraps the ``room_msg`` bus primitive with
+    the same ergonomic shape as :func:`send_cross_shard_message`:
+
+    - **Local-vs-remote dispatch.** If the room row is on this shard
+      (or is global, ``shard_id == "*"``), the helper looks up the
+      instance and calls ``room.msg_contents(text, exclude=...,
+      from_obj=...)`` directly — no bus hop, no polling latency.
+      Otherwise it inserts a ``room_msg`` bus row addressed to the
+      room's owning shard.
+    - **Single DB read for the primary target.** One
+      ``values_list`` query reads the room's ``shard_id`` — no
+      ``from_db`` instantiation on the lookup itself.
+    - **Optional pks are hints, not targets.** ``exclude_pks`` and
+      ``from_obj_pk`` are dropped silently if they don't resolve
+      locally (or trip the chokepoint) — same behaviour as the
+      receiver-side ``_handle_room_msg``. Losing an exclude hint is
+      strictly better than failing the whole broadcast.
+
+    Args:
+        room_pk: the target room's ``ObjectDB`` pk.
+        text: the rendered, attribution-included string to broadcast.
+            Sender composes; the helper and the bus are dumb. Must be
+            JSON-serialisable on the remote path (the
+            ``Message.payload`` JSONField raises on non-serialisable
+            content at send time).
+        exclude_pks: optional iterable of pks to skip during fanout.
+            Pks resolved locally for the local path; serialised for
+            the remote path and resolved on the receiver. Unresolved
+            pks (deleted, on yet another shard) are silently dropped.
+        from_obj_pk: optional pk of the sender, looked up locally
+            (or on the receiver) and passed as ``from_obj`` to
+            ``msg_contents``. Skipped silently if it doesn't resolve.
+
+    Returns:
+        ``True`` if the broadcast was dispatched locally or queued
+        for remote delivery. ``False`` if the helper rejected the
+        call because the room row doesn't exist (warning logged).
+    """
+    from evennia.objects.models import ObjectDB
+
+    from .config import get_shard_id
+    from .messagebus import send_message
+    from .tenancy import shard_context
+
+    # Escape the multitenant auto-filter for the visibility lookup —
+    # see send_cross_shard_message above for the rationale.
+    with shard_context(None):
+        rows = list(
+            ObjectDB.objects.filter(pk=room_pk)
+            .values_list("shard_id", flat=True)[:1]
+        )
+    if not rows:
+        log.warning(
+            "send_cross_shard_room_message: target room pk=%r does "
+            "not exist; rejecting",
+            room_pk,
+        )
+        return False
+    target_shard = rows[0]
+
+    current = get_shard_id()
+    if target_shard == current or target_shard == "*":
+        # Local fast-path: room is here, msg_contents is a synchronous
+        # call. Resolve hint pks locally; silently drop any that can't
+        # be loaded (matches receiver-side behaviour).
+        room = ObjectDB.objects.get(pk=room_pk)
+        exclude = []
+        for ex_pk in exclude_pks or ():
+            try:
+                exclude.append(ObjectDB.objects.get(pk=ex_pk))
+            except ObjectDB.DoesNotExist:
+                continue
+        from_obj = None
+        if from_obj_pk is not None:
+            try:
+                from_obj = ObjectDB.objects.get(pk=from_obj_pk)
+            except ObjectDB.DoesNotExist:
+                from_obj = None
+        room.msg_contents(text, exclude=exclude, from_obj=from_obj)
+        return True
+
+    # Remote delivery: queue a room_msg row for the room's shard.
+    payload = {"room_pk": room_pk, "text": text}
+    if exclude_pks:
+        payload["exclude_pks"] = list(exclude_pks)
+    if from_obj_pk is not None:
+        payload["from_obj_pk"] = from_obj_pk
+    send_message(
+        kind="room_msg",
+        payload=payload,
         to_shard=target_shard,
     )
     return True

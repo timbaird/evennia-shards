@@ -7,7 +7,7 @@ How the library's unit tests are configured to run without a consumer gamedir.
 The library's tests must verify the library, not a consumer game. They should:
 
 - Run from the library root with no dependency on `examples/demo_game/` (or any other gamedir).
-- Not require Evennia's runtime services (Twisted reactor, Portal, Server, sessions, network listeners). Only Django's ORM is needed for testing the chokepoints.
+- Not require Evennia's runtime services (Twisted reactor, Portal, Server, sessions, network listeners). Only Django's ORM is needed.
 - Pass deterministically regardless of what the consumer's `settings.py` looks like.
 
 ## Structure
@@ -36,7 +36,7 @@ Mixing them would either pollute the library package with non-test infrastructur
 
 - `INSTALLED_APPS` += `evennia_shards`
 - `DATABASES` → in-memory sqlite (`":memory:"`)
-- `SHARDS_ROLE = "shard"`, `SHARD_ID = "shard0"` — pinned so the chokepoints are exercisable
+- `SHARDS_ROLE = "shard"`, `SHARD_ID = "shard0"` — pinned so the tenancy install runs with a real tenant scope
 - `ROOT_URLCONF = "tests.urls"` — overrides Evennia's default `"web.urls"`, which expects a gamedir's `web/` module
 - `GAME_DIR` and `LOG_DIR` → `tempfile.gettempdir()` paths so the path-derived defaults in `settings_default` resolve
 

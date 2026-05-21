@@ -4,7 +4,229 @@ A running log of high-level milestones as the project moves from design into bui
 
 This is not a changelog (use `git log` for that) and not a roadmap (the phasing lives in [archive/evennia-shards-HANDOVER.md](archive/evennia-shards-HANDOVER.md#phased-poc-plan)). It is a thin index of "what has actually happened so far."
 
+> **Note on older entries.** Entries before 2026-05-21 describe milestones in the order they happened. Some describe the earlier four-chokepoint isolation design that has since been replaced by django-multitenant ([tenancy.md](tenancy.md)); they're kept as the historical record of how the library got here, not as a description of how the code looks today.
+
 ## Milestones
+
+### 2026-05-21 — Shard partition: django-multitenant adopted
+
+The library's shard partition is enforced via [django-multitenant](https://github.com/citusdata/django-multitenant) 4.1.1. Every query through `ObjectDB.objects` carries `WHERE shard_id IN (current, '*')` automatically; the boundary is in the database, not in Python. See [tenancy.md](tenancy.md) for the live design.
+
+Library entry points: `src/evennia_shards/tenancy.py` — `bootstrap_tenant_context()` sets the process-wide scope based on `SHARDS_ROLE`; `install_tenancy_on_objectdb()` late-binds `TenantMeta`, the three identity properties, wrapped `save` / `_do_update` / `__setattr__`, the global Django query decorators, and the patched `get_queryset` / `bulk_create` on the manager class. The two-element tenant list (`[Shard(current), Shard("*")]`) gives every shard visibility of its own rows plus `"*"`-stamped globals natively via multitenant's IN-filter mode, without subclassing any QuerySet.
+
+`cross_shard_move` uses `qs.update(shard_id=..., db_location_id=...)` for the cross-shard write — bypasses the tenant-column immutability check at the SQL level. Two narrow rule-breaks documented inline at the call site: `with shard_context(None):` for the target-shard validation read, and `object.__setattr__` to sync the in-memory instance after `qs.update`.
+
+`shard_aware_global_search` wraps its `values_list` queryset construction inside `shard_context(None)` to escape the auto-filter and find rows on every shard; the post-resolution instance load stays on the auto-filtered manager (only local matches are loaded).
+
+`make_shard_at_post_login` (shard-side) gates `refresh_from_db` behind an explicit `ObjectDB.objects.filter(pk).exists()` check, because Django's `refresh_from_db` routes through `_base_manager` (unfiltered) and would otherwise silently load a foreign row.
+
+Smoke-tested end-to-end against the three demo gamedirs: login flow → router auto-redirect to character's shard → IC on shard → cross-shard `@tel` between shard0 and shard1 → `cross_shard_dig` on a remote shard → ticket auth + session reattach. Tests: 290 passing in `src/evennia_shards/tests.py`.
+
+The library previously enforced the partition via a four-chokepoint design (`from_db` override, `pre_save` / `pre_delete` signals, `QuerySet.update` override, `shard_writes_allowed_for` bypass). That design is archived at [archive/shard-isolation.md](archive/shard-isolation.md) for historical context.
+
+### 2026-05-20 — `@tel`: cross-shard leave/arrive announces via new `room_msg` bus kind
+
+Closes the announce gap on cross-shard movement. Vanilla's `move_to` fires `announce_move_from` on the source room and `announce_move_to` on the destination room; `cross_shard_move` bypasses `move_to` entirely (atomic DB update + session redirect, no per-room hook firing), so both announces silently dropped — a stationary observer in the source room saw no departure, a stationary observer in the destination saw no arrival.
+
+The earlier framing of "destination-side announce is architecturally not doable" turned out to be wrong. Re-using the same fire-and-forget bus pattern as `flush_from_cache` makes it straightforward: source process tells destination process to run a local `msg_contents` against a foreign room.
+
+Fix has three layers:
+
+- **New bus kind: `room_msg`**. Multicast variant in the `*_msg` family: payload `{"room_pk": <int>, "text": <str>, "exclude_pks": [<int>, ...]?, "from_obj_pk": <int>?}`. Receiver looks up the room and calls `room.msg_contents(text, exclude=..., from_obj=...)`. Sender composes; receiver is dumb. Optional pks (`exclude_pks` / `from_obj_pk`) are hints — pks that don't resolve are dropped silently rather than failing the whole message (losing a hint is strictly better than losing the broadcast). Misroute of the primary `room_pk` trips the chokepoint and follows the standard defer → undeliverable-reply path, same as `obj_msg`.
+- **New sender helper: `send_cross_shard_room_message`**. Mirrors `send_cross_shard_message`'s shape: one `values_list` to read the room's `shard_id`; local-fast-path if the room is on this shard (calls `room.msg_contents` directly, no bus hop); otherwise queues a `room_msg` bus row. Optional pks resolved locally on the fast-path, serialised into the payload on the remote path.
+- **Wired into `ShardAwareCmdTeleport.func`**. Source-side announce fires synchronously before `cross_shard_move` via the local source room's `msg_contents` (source room is local in this branch, since obj is local). Destination-side announce fires after `cross_shard_move` via `send_cross_shard_room_message` (destination is foreign, so the bus path is what gets exercised). Both gated on `/quiet`. Caller-facing confirmation is **not** gated — fixing a separate inversion bug where our previous `/quiet` implementation silenced the caller, opposite to vanilla. Vanilla's `/quiet` only suppresses room announces; the caller always sees confirmation. Test pinned the corrected behaviour.
+
+A new bus kind was preferred over baking an `announce_arrival` specific kind in for one consumer. The library shouldn't own the announce concept (a game-layer notion) — `room_msg` is infrastructure ("broadcast to a room across shards") and the announce composition is game-layer code in the consumer or in `ShardAwareCmdTeleport.func`. Other future use cases — cross-shard world events, system messages targeting specific foreign rooms, eventual cross-shard chat — share the primitive.
+
+Smoke-tested in the demo gamedirs by leaving an observer character in Limbo on shard0 and teleporting another character (root) cross-shard twice:
+
+| Step | Observer in Limbo sees |
+|---|---|
+| root teleports Limbo → newroom (shard1) | `root is leaving Limbo, heading for newroom.` |
+| root teleports newroom (shard1) → Limbo | `root arrives from newroom.` |
+
+(The "has entered the game" system message that follows is the known cross-shard re-login artifact, unrelated.)
+
+`/quiet` verified separately to suppress both announces while still emitting the caller-facing confirmation.
+
+**Files:** `src/evennia_shards/messagebus.py` (new `_handle_room_msg`), `src/evennia_shards/messaging.py` (new `send_cross_shard_room_message`), `src/evennia_shards/__init__.py` (export), `src/evennia_shards/teleport.py` (announce wiring + `/quiet` fix), `src/evennia_shards/tests.py` (+17 tests: 6 receiver-handler, 6 sender helper, 5 announce wiring; existing `/quiet` test rewritten to assert vanilla-aligned behaviour). `DESIGN/cross-shard-message-bus.md` and `DESIGN/library-integration-risks.md` updated. Suite at 280. Branch: `shard-aware-teleport`.
+
+### 2026-05-20 — `@tel`: obj-side `teleport` lock check added to cross-shard branch
+
+Closes the security-consistency gap that emerged from the dispatch design: the both-targets-local branch delegated to vanilla `super().func()` and therefore honoured vanilla's [`caller.permissions.check("Admin") or obj.access(caller, "teleport")`](https://github.com/evennia/evennia/blob/main/evennia/commands/default/building.py) check at building.py:3922, but the cross-shard branch bypassed `super().func()` entirely and silently skipped the check. A `teleport`-locked obj that was unteleportable locally became teleportable cross-shard — wrong direction.
+
+Fix: copy vanilla's check verbatim into the cross-shard branch, after `/loc` and `/intoexit` refusals and after the same-position short-circuit, before the call to `cross_shard_move`. Three lines, one new comment block. The "intentionally skipped" comment block below was trimmed to mention only `teleport_here` (destination-side), which remains deferred — the destination row lives on the foreign shard, so its lock can't be evaluated locally without a bus round-trip.
+
+Smoke-tested in the demo gamedirs with a non-Admin Builder account (`tim`):
+
+| Setup | Path | Result |
+|---|---|---|
+| root (superuser), `teleport:false()` on ball | cross-shard | succeeds (Admin bypass) |
+| tim (Builder, no Admin), `teleport:false()` on ball | cross-shard | refused with lock message |
+| tim (Builder, no Admin), `teleport:false()` on ball | local | refused with **same** lock message (vanilla parity) |
+
+The smoke test surfaced a separate Evennia subtlety worth noting for future test setup: `cmd:perm(Builder)` on `@tel` checks the **account's** permissions via the lockfunc (see [`evennia/locks/lockfuncs.py:163`](file:///c:/Users/micro/Documents/FCM/libraries/evennia-shards/venv/Lib/site-packages/evennia/locks/lockfuncs.py#L163)), whereas our in-func `caller.permissions.check("Admin")` checks the character's. Granting Builder to a character alone leaves the command invisible; the account also needs the permission (`@perm/account tim = Builder`). Two separate permission surfaces, both come into play.
+
+**Files:** `src/evennia_shards/teleport.py` (new check + trimmed skipped-behaviour comment), `src/evennia_shards/tests.py` (3 new tests: lock-blocks-non-admin, Admin-bypass, non-Admin-allowed-when-obj-grants-access; `_FakeCaller` extended with `permissions.check` / `access` surfaces). Suite at 263. `DESIGN/library-integration-risks.md` § `CmdTeleport` updated. Branch: `shard-aware-teleport`.
+
+### 2026-05-20 — `@tel`: trivial vanilla-parity gaps closed
+
+Four small alignments with vanilla `CmdTeleport` / `caller.search`, each independently smoke-tested in the demo gamedirs (root teleporting + ball cross-shard with `me` / `here` / aliases / ambiguous names).
+
+- **Multi-match disambiguation prompt** — both the obj and destination paths in `ShardAwareCmdTeleport.parse` now render the full candidate list (`Multiple matches for 'tavern': #5 (Tavern, shard0), #12 (Tavern, shard1) - specify by dbref.`) instead of a static placeholder. The destination path previously silently fell through to vanilla's "Destination not found." message when multi-match fired; now it raises `InterruptCommand` with the prompt.
+- **Same-position short-circuit** — `ShardAwareCmdTeleport.func` checks `obj.db_location_id == dest_pk` before calling `cross_shard_move`, mirroring vanilla's `obj.location == destination` check ([building.py:3917](https://github.com/evennia/evennia/blob/main/evennia/commands/default/building.py)). Pk uniqueness under the single-Postgres bound makes the instance comparison and the pk comparison equivalent. Saves a no-op bus round-trip and emits vanilla's user-visible "is already at" message.
+- **Caller-relative specials** — `shard_aware_global_search` now resolves `"me"` / `"self"` (→ caller) and `"here"` (→ `caller.location`) before the SQL path, matching vanilla `caller.search` semantics. Always local by construction — no cross-shard routing needed.
+- **Alias matching** — `shard_aware_global_search` now also matches Tag rows with `db_tagtype="alias"`, using the same `Q(...) | (Q(...) & Q(...))` + `.distinct()` pattern vanilla `ObjectDBManager.object_search` uses. Composes correctly with the existing `tag=` / `tag_category=` zone filter (separate `filter()` calls = separate joins). Important convention note: aliases live in `db_tagtype="alias"`, not `db_category="alias"` — confirmed against `AliasHandler._tagtype = "alias"` in `evennia/typeclasses/tags.py`.
+
+After these, name-resolution parity with vanilla `caller.search(global_search=True)` is complete except for fuzzy / partial name matching (the regex fallback when exact fails). Teleport-side gaps that remain are documented but not yet closed: cross-shard `/loc`, cross-shard `/intoexit`, foreign-obj move, `announce_move_from` / `announce_move_to`, obj `teleport` lock check, destination `teleport_here` lock check.
+
+**Files:** `src/evennia_shards/search.py` (specials short-circuit + alias predicate + scope-note update), `src/evennia_shards/teleport.py` (`_format_multiple` helper + multi-match dispatch + already-at short-circuit), `src/evennia_shards/tests.py` (+14 tests; 260 total). `DESIGN/shard-aware-search.md` and `DESIGN/library-integration-risks.md` § `CmdTeleport` updated. Branch: `shard-aware-teleport`.
+
+### 2026-05-20 — `cross_shard_move` invalidates destination's idmapper via `flush_from_cache` bus message
+
+Closes the contents-cache-stale issue that surfaced when an unpuppeted
+object (an item, in this case) was teleported cross-shard: the
+destination room's in-process `contents_cache` on the destination
+shard would keep its pre-move view, and `look` / `room.contents`
+on the destination would omit the just-arrived obj even though the
+DB row was correctly stamped.
+
+Root cause: `cross_shard_move`'s `obj.save()` sets
+`_safe_contents_update = True` to suppress Evennia's post-save
+signal (which would otherwise dereference the now-foreign
+`db_location` and trip the chokepoint). The suppression is
+mandatory, but it also means neither the source room's nor the
+destination room's contents_cache gets updated by the signal. The
+source side stays consistent for free via the source process's
+`flush_from_cache` on the moved obj — but the destination process
+never sees that eviction.
+
+Fix: a new `flush_from_cache` message kind on the cross-shard
+message bus, with payload `{"pks": [<int>, ...]}`. Receiver iterates
+the pks and, for each that's currently in this process's `ObjectDB`
+idmapper, calls `instance.flush_from_cache(force=True)` — same
+mechanism Evennia uses for its own idmapper management. Pks not
+cached are no-ops; the handler is idempotent.
+
+`cross_shard_move` step 8 (new): after the per-session redirect
+block, send `flush_from_cache` to `target_shard` with the
+destination row's pk. Gated on `target_shard != current_shard`
+(the bus refuses same-shard sends). Send failure is logged but
+doesn't roll back the move — worst case the destination shows
+stale contents until the room is next evicted for some other reason.
+
+Naming intent: the message is named after the **mechanic** (what the
+handler does) rather than the **trigger** (cross-shard arrival). Any
+future cross-shard mutation that other shards should drop their
+cached view of — `delete`, mass attribute changes, world rebuilds —
+can publish the same kind without needing a new message type.
+
+Verified live in the demo gamedirs: ball moved cross-shard to a
+previously-loaded destination room is visible in `look` and in
+`room.contents` immediately on arrival.
+
+**Files:** `src/evennia_shards/messagebus.py` (handler), `src/evennia_shards/handoff.py` (sender + docstring), `src/evennia_shards/teleport.py` (debug-message detection hook removed; no longer load-bearing), `DESIGN/cross-shard-message-bus.md` (new kind documented). Branch: `shard-aware-teleport`.
+
+### 2026-05-20 — `cross_shard_character_move` renamed `cross_shard_move`
+
+The primitive has always worked on any `ObjectDB`-derived row, not just characters — the `_character_` segment in the name was load-bearing as documentation but actively misleading as the API surface. With `CmdCrossShardMove` gone, the shorter `cross_shard_move` no longer competes with anything for the namespace. Pure rename: docstrings polished to drop "character"-specific language; the `CrossShardCharacterMoveTests` test class renamed to `CrossShardMoveTests`. 204 tests passing.
+
+### 2026-05-20 — `CmdCrossShardMove` removed; `@tel` is the in-game entrypoint
+
+With [`ShardAwareCmdTeleport`](library-integration-risks.md#cmdteleport--narrow-override-delegate-to-vanilla-when-local) landing — vanilla `@tel` that transparently dispatches local or cross-shard via the same `cross_shard_move` primitive — the dedicated `cross_shard_move` admin command became redundant. Two ways to do the same thing forces admins to remember which one to use; one way is cleaner. `CmdCrossShardMove` removed from the library; the matching `CmdCrossShardMoveTests` removed; `AdminCommandAutoInstallTests` no longer asserts the key; the demo-gamedir stub-comment updated.
+
+The `cross_shard_move` primitive itself is unchanged — every consumer that was previously calling it directly (FCM, the library's own `@tel` override) continues to. What's gone is only the in-game command surface that wrapped it.
+
+Migration for consumers: anywhere `cross_shard_move <shard> <room_pk>` was typed in-game, type `@tel #<room_pk>` instead. The override resolves the target's shard from the dbref and routes the move via the same primitive.
+
+**Files:** `src/evennia_shards/commands.py` (CmdCrossShardMove deleted), `src/evennia_shards/apps.py` (no longer auto-installed), `src/evennia_shards/tests.py` (CmdCrossShardMoveTests deleted), `examples/demo_shard0/commands/command.py` (comment updated). Branch: `shard-aware-teleport`.
+
+### 2026-05-18 — `CmdCrossShardMove` promoted from demo into library
+
+The cross-shard movement admin command had been living in
+`examples/demo_shard0/commands/command.py` since the
+`cross_shard_move` spike, marked `TEMPORARY`. Promoted into
+[`evennia_shards/commands.py`](../src/evennia_shards/commands.py)
+alongside `CmdShardCheck` and `CmdCrossShardDig`: same Developer lock,
+same "Shard Management" help category, auto-installed into
+`CharacterCmdSet` via the existing `at_cmdset_creation` patch in
+`AppConfig.ready()`.
+
+The command is a thin wrapper around the
+`cross_shard_move` primitive — validates `target_shard` is
+in `SHARD_URLS`, parses `room_pk` as int, calls the primitive, prints
+the `MoveResult`. The primitive itself is what's load-bearing; the
+command is just an admin-facing entrypoint that doesn't require the
+consumer to ship one of their own for bootstrap-time use.
+
+**Why now.** FCM (first real consumer) hit the chicken-and-egg of
+"shard1 has no rooms, can't log in, can't `cross_shard_dig` from
+inside it." `CmdCrossShardDig` solves the room-creation half from
+shard0; this command solves the "now actually walk over there" half.
+The pair give an admin everything needed to bootstrap content on a
+fresh shard without consumer-side scaffolding.
+
+**Consumer notes.** This is an *admin tool*, not a player-facing
+movement mechanism. Consumer games that want IC cross-shard
+movement still need to write their own `CrossShardExit` typeclass
+(or equivalent) that gates the primitive with their safe-state
+predicate — see [consumer-constraints.md § Cross-shard movement
+requires a safe character state](consumer-constraints.md#cross-shard-movement-requires-a-safe-character-state).
+
+**210 tests passing** (204 prior + 6 new in
+`CmdCrossShardMoveTests`): no-args usage, one-arg usage,
+non-integer room_pk, unknown shard validation, happy-path primitive
+delegation (mocked), primitive exception surfaces as error message.
+The `AdminCommandAutoInstallTests` assertion was extended to
+include the new command key.
+
+**Files:** `src/evennia_shards/commands.py` (new command),
+`src/evennia_shards/apps.py` (cmdset patch adds it), demo's
+`commands/command.py` and `commands/default_cmdsets.py` (spike copy
+removed). Branch: `cross-shard-move-cmd`.
+
+### 2026-05-18 — Local multi-process testing on Windows: no view dirs needed
+
+Empirical finding while preparing FCM as the library's first consumer.
+On Windows, three Evennia processes (router + shard0 + shard1) can be
+started from the same `demo_shard0/` gamedir in three different
+PowerShell terminals, each with `--settings settings_<role>`, with no
+view directories, no symlinks, no junctions, and no patching of the
+launcher. All three came up cleanly and listened on their per-role ports.
+
+**Why it works.** Evennia's launcher gates the `--pidfile` argument
+passed to `twistd` on `os.name != "nt"`
+([`evennia_launcher.py:529-532`](../../venv/Lib/site-packages/evennia/server/evennia_launcher.py#L529)).
+On Windows that branch is skipped: `twistd` is never told to write
+`<gamedir>/server/server.pid` or `<gamedir>/server/portal.pid`, so two
+`evennia start` invocations from the same folder don't fight over those
+files. `evennia stop` on Windows uses Win32 console-group signals
+(`GenerateConsoleCtrlEvent`, line 1618-1631) instead of PID-file lookups
+— so each terminal stops its own processes by virtue of being its own
+console.
+
+**What this prevented building.** Earlier in the session we sketched a
+cross-OS `evennia_shards.local_views.create_view()` helper that would
+build view gamedirs via directory junctions on Windows and symlinks on
+POSIX, plus a wrapper CLI variant that would patch `init_game_directory`
+to read PID paths from settings, plus an `AppConfig.ready()`-time
+wrapper around `_get_twistd_cmdline` to inject role-suffixed PID paths.
+All three are dropped — the underlying problem (PID-file collision in a
+shared gamedir) only exists on Unix, and on Unix the demo's existing
+symlinked-view recipe already covers it.
+
+**Decision: documentation, not code.** The OS-specific recipes are
+captured as the canonical reference in
+[deployment-topology.md § Local development](deployment-topology.md#local-development),
+with [shard-settings.md](shard-settings.md#localhost-multi-instance-game-directories)
+and [`examples/README.md`](../examples/README.md) pointing back there
+for the rationale. The previously-conflicting claims in those two docs
+(deployment-topology said "same folder works", shard-settings said
+"symlinked view dirs needed") are now resolved as the Windows and
+Unix cases of one underlying split.
+
+No library code changed. No new tests. The discovery does, however,
+trim a substantial would-have-been workstream from the roadmap.
 
 ### 2026-05-04 — Shards run WebSocket-only: HTTP webserver router-only by default
 
@@ -36,7 +258,7 @@ Follow-on to the WebSocket-level redirect milestone below. The PoC ship covered 
 - `protocol_flags["SHARDS_TICKET_AUTHED"]` — transient Portal→Server bridge. Portal sets it on ticket-bearing connections to the router; Evennia AMP-syncs it onto the Server's session.
 - `account.db._shards_at_ooc_menu` — persistent intent. Server-only writer in two places: `shard_aware_at_post_login` (sets True when it sees the protocol flag) and `ShardAwareCmdIC.func` (sets False on `@ic`). Same Server process owns both write-points and the read in subsequent `at_post_login`s, so coherent.
 
-`_redirect_to_character_shard` is now flag-neutral — it can run from a shard's Server during `cross_shard_character_move` without creating a cross-process write the router would never see.
+`_redirect_to_character_shard` is now flag-neutral — it can run from a shard's Server during `cross_shard_move` without creating a cross-process write the router would never see.
 
 **Refresh-while-IC routes directly to the shard.** Browser refresh re-fetches the webclient page from the router, but the JS opens its WebSocket directly to the shard via localStorage routing. `ShardRedirectScriptMiddleware` injects an inline `<script>` immediately before `evennia.js`'s `<script>` tag (regex match on the rendered HTML); the inline script reads `localStorage["evennia_shards_last_target"]` and `PerformanceNavigationTiming.type === "reload"` synchronously, then overrides `window.wsurl` directly. `Evennia.init` reads `window.wsurl` ~500ms later inside `WebsocketConnection`, by which time our override has taken effect. No router round-trip on refresh, no flash through the router OOC menu.
 
@@ -50,7 +272,7 @@ Follow-on to the WebSocket-level redirect milestone below. The PoC ship covered 
 
 ### 2026-05-04 — WebSocket-level cross-shard redirect (replaces page navigation)
 
-Cross-shard transitions (`@ic`, `@ooc`, `cross_shard_character_move`) now operate at the WebSocket connection layer instead of via full-page navigation. When the server emits a `shard_redirect` OOB, the JS plugin closes the current WebSocket and opens a new one to the destination's WS URL with the ticket as a query parameter; the browser page itself does not reload. UI state, scrollback, plugins, command history all persist across the transition.
+Cross-shard transitions (`@ic`, `@ooc`, `cross_shard_move`) now operate at the WebSocket connection layer instead of via full-page navigation. When the server emits a `shard_redirect` OOB, the JS plugin closes the current WebSocket and opens a new one to the destination's WS URL with the ticket as a query parameter; the browser page itself does not reload. UI state, scrollback, plugins, command history all persist across the transition.
 
 Architectural rationale beyond the immediate UX win:
 
@@ -62,7 +284,7 @@ Architectural rationale beyond the immediate UX win:
 
 **Behaviour change at PoC ship time:** with the URL bar no longer carrying the ticket post-redirect, the original `SHARDS_TICKET_AUTHED` per-WebSocket flag did not persist across page refresh. The follow-on milestone above resolves this with the two-flag OOC-intent mechanism (transient `protocol_flags["SHARDS_TICKET_AUTHED"]` Portal→Server bridge + persistent `account.db._shards_at_ooc_menu` Server-only attribute) — `@ooc` remains a sticky preference across refresh / reconnect / next-day login until cleared by `@ic`.
 
-196 tests passing on the PoC branch at this checkpoint (URL strings updated from `http://` to `ws://` everywhere). Live smoke verified: IC, OOC, and `cross_shard_character_move` all transition cleanly with page persistence; the connection-lost flash is gone; real disconnects still render the standard error message. Refresh handling completed in the follow-on milestone above.
+196 tests passing on the PoC branch at this checkpoint (URL strings updated from `http://` to `ws://` everywhere). Live smoke verified: IC, OOC, and `cross_shard_move` all transition cleanly with page persistence; the connection-lost flash is gone; real disconnects still render the standard error message. Refresh handling completed in the follow-on milestone above.
 
 **Files:** `evennia_shards/handoff.py` (`_redirect_to_character_shard` builds WS URL), `evennia_shards/commands.py` (`ShardAwareCmdOOC` builds WS URL), `evennia_shards/static/evennia_shards/js/shard_redirect.js` (rewritten for WS swap + emit-wrap suppression), demo gamedirs settings updated to `ws://` URLs. Docs: `DESIGN/shard-settings.md`, `DESIGN/ticket-auth-flow.md`, `DESIGN/library-integration-risks.md` updated for the new mechanism. Branch: `websocket-level-redirect-poc`.
 
@@ -103,9 +325,9 @@ Unusable start-location cases (`shard_id` is `None`, `"*"`, or `"router"`) log a
 
 177 tests passing (170 prior + 7 new in `ShardAwareCreateCharacterTests`): happy path, vanilla-returned-None pass-through, unstamped/global/router-owned/no-location cases, and kwargs pass-through. Live smoke pending.
 
-### 2026-05-03 — Inventory recursion + rename to `cross_shard_character_move`
+### 2026-05-03 — Inventory recursion + rename to `cross_shard_move`
 
-Renamed `cross_shard_move_to` → `cross_shard_character_move` to reflect that the primitive is character-shaped (sessions, puppet tags, redirects). Added recursive inventory movement: all contents (items, bags-within-bags, arbitrarily nested) have their `shard_id` bulk-updated and are evicted from the idmapper in the same atomic block as the character. Contents' `db_location_id` is unchanged — parent pk doesn't change across shards. Global (`"*"`) items are left alone.
+Renamed `cross_shard_move_to` → `cross_shard_move` to reflect that the primitive is character-shaped (sessions, puppet tags, redirects). Added recursive inventory movement: all contents (items, bags-within-bags, arbitrarily nested) have their `shard_id` bulk-updated and are evicted from the idmapper in the same atomic block as the character. Contents' `db_location_id` is unchanged — parent pk doesn't change across shards. Global (`"*"`) items are left alone.
 
 **Technical approach:** `_collect_all_contents(root_pk)` does breadth-first pk traversal via `values_list` (avoids `from_db`). Single `qs.update` for contents — no bypass needed since items have `shard_id == current_shard`. Idmapper eviction uses `flush_from_cache(force=True)` on cached instances with direct dict-pop fallback.
 
@@ -113,7 +335,7 @@ Renamed `cross_shard_move_to` → `cross_shard_character_move` to reflect that t
 
 ### 2026-05-03 — Pre-emptive session detach: zombie session fix for cross-shard round-trips
 
-Live smoke testing of `cross_shard_character_move` round-trips (shard0 → shard1 → shard0) exposed a zombie session bug that caused a black screen on the return move. Root cause: Evennia's asynchronous disconnect handler (`unpuppet_object`) runs after the WebSocket close triggered by the redirect, but by that point the character's `shard_id` has been mutated to the target shard and the bypass context has exited — so `pre_save` refuses.
+Live smoke testing of `cross_shard_move` round-trips (shard0 → shard1 → shard0) exposed a zombie session bug that caused a black screen on the return move. Root cause: Evennia's asynchronous disconnect handler (`unpuppet_object`) runs after the WebSocket close triggered by the redirect, but by that point the character's `shard_id` has been mutated to the target shard and the bypass context has exited — so `pre_save` refuses.
 
 **Full causal chain:**
 
@@ -122,7 +344,7 @@ Live smoke testing of `cross_shard_character_move` round-trips (shard0 → shard
 
 **First fix attempt (calling `unpuppet_object` inside bypass) failed.** Evennia's `at_post_unpuppet` hook does `self.db.prelogout_location = self.location`, which dereferences the location FK to the room on the target shard. The room is NOT in the bypass set, so `from_db` refuses.
 
-**Working fix: minimal session detach.** Instead of calling Evennia's full `unpuppet_object`, `cross_shard_character_move` now clears `session.puppet = None` and `session.puid = None` for each puppeting session, and removes the `"puppeted"` tag from the character. This prevents the disconnect handler from entering the puppet cleanup path (its `if obj:` guard finds `None`), and prevents `server_maintenance` from trying to `from_db` a now-foreign row via `get_by_tag("puppeted")`.
+**Working fix: minimal session detach.** Instead of calling Evennia's full `unpuppet_object`, `cross_shard_move` now clears `session.puppet = None` and `session.puid = None` for each puppeting session, and removes the `"puppeted"` tag from the character. This prevents the disconnect handler from entering the puppet cleanup path (its `if obj:` guard finds `None`), and prevents `server_maintenance` from trying to `from_db` a now-foreign row via `get_by_tag("puppeted")`.
 
 **Why minimal detach is safe:** The destination shard's `puppet_object` overwrites `db_sessid` and `db_account` when the player arrives, so stale values in those fields are harmless. The skipped hooks (`at_pre_unpuppet`, `at_post_unpuppet`) are not needed because the character is leaving this process entirely.
 
@@ -132,7 +354,7 @@ Live smoke testing of `cross_shard_character_move` round-trips (shard0 → shard
 
 ### 2026-05-03 — Idmapper / Attribute-cache staleness fix for cross-shard moves
 
-Live smoke testing of `cross_shard_character_move` (shard0 → shard1 → shard0 round-trip) exposed two bugs caused by Evennia's in-memory caching defeating cross-process DB updates. Both share the same root cause: when one process updates a row's `shard_id`, other processes' caches still hold the old value.
+Live smoke testing of `cross_shard_move` (shard0 → shard1 → shard0 round-trip) exposed two bugs caused by Evennia's in-memory caching defeating cross-process DB updates. Both share the same root cause: when one process updates a row's `shard_id`, other processes' caches still hold the old value.
 
 **Bug 1: Router IC command redirects to wrong shard.** After moving a character from shard0 to shard1, going OOC back to the router, then typing `ic` — the router redirected to shard0 (old `shard_id`) instead of shard1.
 
@@ -144,15 +366,15 @@ Live smoke testing of `cross_shard_character_move` (shard0 → shard1 → shard0
 - **Root cause:** The Account's Attribute-handler cache on shard0 still held the Python object from the outbound move (whose `shard_id` field was `"shard1"`). Evennia's default `at_post_login` read `_last_puppet` from this stale cache and handed the stale object to `puppet_object`, which tried to save it — tripping the `pre_save` chokepoint.
 - **Fix:** Installed a thin `at_post_login` wrapper on shards (`make_shard_at_post_login` in `hooks.py`) that flushes the `_last_puppet` character from the idmapper and refreshes its fields from the DB before delegating to Evennia's original `at_post_login`.
 
-**General pattern documented:** Any code path that reads an `ObjectDB` field which may have been updated by another process must use `flush_from_cache(force=True)` + `refresh_from_db()` before acting on the value. See [shard-isolation.md](shard-isolation.md#cross-process-cache-staleness) for the full write-up.
+**General pattern documented:** Any code path that reads an `ObjectDB` field which may have been updated by another process must use `flush_from_cache(force=True)` + `refresh_from_db()` before acting on the value. See [shard-isolation.md](archive/shard-isolation.md#cross-process-cache-staleness) for the full write-up.
 
 **Files changed:** `hooks.py` (flush+refresh in `_is_redirectable_character`, new `make_shard_at_post_login` factory), `commands.py` (flush+refresh in `ShardAwareCmdIC.func()`), `apps.py` (shard-side `at_post_login` wrapper installation alongside existing router override), `tests.py` (`flush_from_cache` stub on `_FakeCharacter`).
 
-**Docs updated:** [ticket-auth-flow.md](ticket-auth-flow.md) (shards no longer use vanilla `at_post_login`), [library-integration-risks.md](library-integration-risks.md) (shard wrapper added to `at_post_login` coupling section), [shard-isolation.md](shard-isolation.md) (new "Cross-process cache staleness" section).
+**Docs updated:** [ticket-auth-flow.md](ticket-auth-flow.md) (shards no longer use vanilla `at_post_login`), [library-integration-risks.md](library-integration-risks.md) (shard wrapper added to `at_post_login` coupling section), [shard-isolation.md](archive/shard-isolation.md) (new "Cross-process cache staleness" section).
 
 164 tests passing.
 
-### 2026-05-02 — `cross_shard_character_move` spike 1: character move (unit-tested)
+### 2026-05-02 — `cross_shard_move` spike 1: character move (unit-tested)
 
 The cross-shard handoff primitive landed in [`evennia_shards/handoff.py`](../src/evennia_shards/handoff.py). Initial scope: move a single character row across shards (inventory recursion added 2026-05-03 — see milestone above), with proper composition of the three primitives the handoff needs (atomic DB writes via the chokepoint bypass, idmapper eviction, per-session ticket+redirect).
 
@@ -174,7 +396,7 @@ Three findings worth recording for future work:
 
 ### 2026-05-02 — Shard isolation refactor + `shard_writes_allowed_for` bypass primitive
 
-The shard isolation mechanism was reorganised into a dedicated module and gained the long-anticipated bypass primitive — together they're the foundation Phase 2's `cross_shard_character_move` will be built on.
+The shard isolation mechanism was reorganised into a dedicated module and gained the long-anticipated bypass primitive — together they're the foundation Phase 2's `cross_shard_move` will be built on.
 
 **Refactor.** The four chokepoints (`pre_save`, `pre_delete`, `from_db`, `QuerySet.update`) were extracted from `apps.py` into [`evennia_shards/isolation.py`](../src/evennia_shards/isolation.py). `apps.py` now calls a single `install_chokepoints()` entry point. Pure relocation, no behavioural change — the existing chokepoint test suite (~30 cases) passed without modification.
 
@@ -185,7 +407,7 @@ The shard isolation mechanism was reorganised into a dedicated module and gained
 
 Scoped to the `with` block, nesting-safe, exception-safe (cleanup runs in `finally`). Public API, exported from `evennia_shards.__init__`.
 
-Documented in [shard-isolation.md](shard-isolation.md#bypass-shard_writes_allowed_for) — the doc gained a new "Bypass" section explaining the semantics, identity tracking, and composition with `transaction.atomic()` and `flush_from_cache()` for handoff scenarios.
+Documented in [shard-isolation.md](archive/shard-isolation.md#bypass-shard_writes_allowed_for) — the doc gained a new "Bypass" section explaining the semantics, identity tracking, and composition with `transaction.atomic()` and `flush_from_cache()` for handoff scenarios.
 
 148 tests passing (138 prior + 10 new in `ShardWritesAllowedForTests`): allows-remote-save, scoped-cleanup, no-auto-stamp-of-explicit-id, allows-remote-delete, only-listed-objects, nested-bypass, exception-cleanup, allows-from-db, allows-qs-update, partial-qs-update-still-raises.
 
@@ -389,7 +611,7 @@ The bus from [cross-shard-message-bus.md](cross-shard-message-bus.md) is in plac
 
 ### 2026-04-29 — Bespoke spike: all four chokepoints land with isolated tests
 
-The `bespoke` branch now carries all four chokepoints documented in [shard-isolation.md](shard-isolation.md), with full automated test coverage. The four-chokepoint spike is functionally complete.
+The `bespoke` branch now carries all four chokepoints documented in [shard-isolation.md](archive/shard-isolation.md), with full automated test coverage. The four-chokepoint spike is functionally complete.
 
 - **`pre_save` chokepoint** (commit `80226be`): the existing auto-stamp handler grew a second arm — refuse the save if `instance.shard_id` is set and is neither the current shard nor `"*"`. New `ShardIsolationError` exception type. Live smoke test confirmed via in-game `@py`.
 - **`pre_delete` chokepoint** (commit `0bcce76`): mirrors `pre_save` minus the auto-stamp arm. Refuses to delete a row whose `shard_id` is neither current nor `"*"` (and not `None`, since legacy/unstamped rows are tolerated). Covers both `instance.delete()` and `qs.delete()` because Django fires `pre_delete` per affected row even on bulk queryset deletes.
@@ -407,9 +629,9 @@ The `bespoke` branch now carries all four chokepoints documented in [shard-isola
 
 **Beyond the four-chokepoint spike** (Phase 2 / out of scope here):
 
-- ~~Cross-shard ownership handoff and the bypass primitive (`shard_writes_allowed_for(...)`).~~ *Both landed 2026-05-02 — bypass primitive and cross_shard_character_move spike 1 (single-object move) are working with full unit-test coverage. See milestones above.*
+- ~~Cross-shard ownership handoff and the bypass primitive (`shard_writes_allowed_for(...)`).~~ *Both landed 2026-05-02 — bypass primitive and cross_shard_move spike 1 (single-object move) are working with full unit-test coverage. See milestones above.*
 - Backfill migration for legacy NULL rows.
-- ~~Revisit the comparison with `django-multitenant` on the parallel `django-multitenant` branch.~~ *Decided in favour of bespoke chokepoints — see [shard-isolation.md](shard-isolation.md#decision-bespoke-chokepoints-vs-django-multitenant). The `django-multitenant` branch was discontinued without merging.*
+- ~~Revisit the comparison with `django-multitenant` on the parallel `django-multitenant` branch.~~ *Decided in favour of bespoke chokepoints — see [shard-isolation.md](archive/shard-isolation.md#decision-bespoke-chokepoints-vs-django-multitenant). The `django-multitenant` branch was discontinued without merging.*
 
 ### 2026-04-29 — Auto-stamp on save works (hybrid pre_save signal)
 

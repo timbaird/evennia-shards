@@ -135,13 +135,13 @@ Evennia's `AUTO_PUPPET_ON_LOGIN` (default `True`) calls `self.puppet_object(sess
 
 The library must not force `AUTO_PUPPET_ON_LOGIN = False` — both modes must work.
 
-**Router**: exempt from all chokepoints (see [shard-isolation.md](shard-isolation.md)), so it can freely deserialize `_last_puppet`, load characters from any shard, and perform chargen/chardelete. On login with `AUTO_PUPPET_ON_LOGIN = True`, the router reads `_last_puppet`, determines the character's shard, creates a ticket, and redirects. When the player selects a different character (via IC command or character selection), the router overwrites `_last_puppet` with the chosen character before redirecting — so `_last_puppet` is not always strictly the "last puppeted" character; it's the character the router has chosen for the next shard session. The router never actually puppets — it delegates that to the shard.
+**Router**: runs unscoped under the tenancy install (`clear_shard_context()` at startup), so it sees rows on every shard. It can freely deserialize `_last_puppet`, load characters from any shard, and perform chargen/chardelete. On login with `AUTO_PUPPET_ON_LOGIN = True`, the router reads `_last_puppet`, determines the character's shard, creates a ticket, and redirects. When the player selects a different character (via IC command or character selection), the router overwrites `_last_puppet` with the chosen character before redirecting — so `_last_puppet` is not always strictly the "last puppeted" character; it's the character the router has chosen for the next shard session. The router never actually puppets — it delegates that to the shard.
 
-**Shard**: receives the player via ticket auth. `at_post_login` fires and auto-puppet reads `_last_puppet` — the character is on this shard, so `from_db` passes. The ticket's `character_id` and `_last_puppet` agree because the router set `_last_puppet` before redirecting. Shards explicitly set `AUTO_PUPPET_ON_LOGIN = True` in their per-instance settings to ensure ticket auth always triggers puppeting.
+**Shard**: receives the player via ticket auth. `at_post_login` fires and auto-puppet reads `_last_puppet` — the character is local to this shard, so the tenant auto-filter admits it. The ticket's `character_id` and `_last_puppet` agree because the router set `_last_puppet` before redirecting. Shards explicitly set `AUTO_PUPPET_ON_LOGIN = True` in their per-instance settings to ensure ticket auth always triggers puppeting.
 
-A thin wrapper (`make_shard_at_post_login` in `hooks.py`) is installed around Evennia's original `at_post_login` on shards. The wrapper flushes the `_last_puppet` character from the idmapper cache and refreshes its fields from the DB before delegating to the original. This is needed because `cross_shard_character_move` on the *source* shard updates the character's `shard_id` in the DB and writes to the Account's Attribute handler cache; the *destination* shard's Attribute handler cache may still hold the stale Python object with the old `shard_id`. Without the flush+refresh, `puppet_object` would save the stale object and the `pre_save` chokepoint would refuse it. See [shard-isolation.md](shard-isolation.md) for the broader idmapper/Attribute-cache staleness pattern.
+A thin wrapper (`make_shard_at_post_login` in `hooks.py`) is installed around Evennia's original `at_post_login` on shards. The wrapper flushes the `_last_puppet` character from the idmapper cache, then gates `refresh_from_db` behind an explicit `ObjectDB.objects.filter(pk).exists()` check (the auto-filter; Django's `refresh_from_db` itself routes through `_base_manager` and would bypass it — see [tenancy.md](tenancy.md)). If the row is no longer visible (moved off this shard while the account was offline, or hard-deleted), `_last_puppet` is cleared so vanilla `at_post_login` falls through to the OOC menu instead of crashing on `puppet_object`.
 
-**Accounts are AccountDB** (not ObjectDB), so no chokepoint applies — shards load accounts freely during ticket auth.
+**Accounts are AccountDB**, which is not tagged by the tenancy install — shards load accounts freely during ticket auth.
 
 ## IC command override
 
@@ -165,7 +165,7 @@ The injection uses the same pattern as the WebSocket protocol and middleware ove
 - **Router**: vanilla `CmdOOC` stays — normal unpuppet, player stays on the router OOC.
 - **Monolith**: vanilla `CmdOOC` stays; the override is never injected.
 
-The asymmetry with IC (which patches both router and shard) is intentional: IC on a shard without the override would attempt a local puppet, which would either hit chokepoints or cause confusion. OOC on a router is harmless — the vanilla command does exactly what's needed (unpuppet, show OOC menu).
+The asymmetry with IC (which patches both router and shard) is intentional: IC on a shard without the override would attempt a local puppet, which is structurally wrong on a shard process. OOC on a router is harmless — the vanilla command does exactly what's needed (unpuppet, show OOC menu).
 
 ## Auto-puppet on login (`AUTO_PUPPET_ON_LOGIN = True`)
 
@@ -184,7 +184,7 @@ The library replaces `DefaultAccount.at_post_login` on routers with `shard_aware
 
 The override honours the consumer's `AUTO_PUPPET_ON_LOGIN` setting as the first decision: if the consumer has disabled auto-puppet, the library applies *none* of its redirect logic and renders the OOC menu — same observable outcome as vanilla. The library's redirect machinery only activates when `AUTO_PUPPET_ON_LOGIN = True`.
 
-`_is_redirectable_character()` is the predicate that distinguishes the redirect-eligible row from the broken-state row when AUTO_PUPPET is True. The redirect itself reuses the same `_redirect_to_character_shard()` helper (in `evennia_shards/handoff.py`) that `ShardAwareCmdIC` uses, so both router-side entry points (manual `ic <char>` and login-time auto-puppet) share one code path. The helper is the library's single mechanism for "send a player session to a character's owning shard"; the `cross_shard_character_move` primitive (also in `handoff.py`) uses it for per-session redirect after a programmatic handoff.
+`_is_redirectable_character()` is the predicate that distinguishes the redirect-eligible row from the broken-state row when AUTO_PUPPET is True. The redirect itself reuses the same `_redirect_to_character_shard()` helper (in `evennia_shards/handoff.py`) that `ShardAwareCmdIC` uses, so both router-side entry points (manual `ic <char>` and login-time auto-puppet) share one code path. The helper is the library's single mechanism for "send a player session to a character's owning shard"; the `cross_shard_move` primitive (also in `handoff.py`) uses it for per-session redirect after a programmatic handoff.
 
 ### The OOC-intent signals
 
@@ -214,7 +214,7 @@ The protocol flag is the bridge, the account flag is the persistence. Together t
 
 #### Why no shard-side or Portal-side writes to the account flag
 
-Two and only two places write `account.db._shards_at_ooc_menu`: `shard_aware_at_post_login` (sets True on protocol-flag detection) and `ShardAwareCmdIC.func` (sets False on `@ic`). Both are router-Server-side. Any other write would either be cross-process (Portal write, shard-Server write) — invisible to the router-Server's read — or out of scope (vanilla CmdOOC on a monolith doesn't redirect, no flag needed). The shared `_redirect_to_character_shard` helper deliberately does NOT touch the flag, because it can run from a shard's Server process during `cross_shard_character_move`.
+Two and only two places write `account.db._shards_at_ooc_menu`: `shard_aware_at_post_login` (sets True on protocol-flag detection) and `ShardAwareCmdIC.func` (sets False on `@ic`). Both are router-Server-side. Any other write would either be cross-process (Portal write, shard-Server write) — invisible to the router-Server's read — or out of scope (vanilla CmdOOC on a monolith doesn't redirect, no flag needed). The shared `_redirect_to_character_shard` helper deliberately does NOT touch the flag, because it can run from a shard's Server process during `cross_shard_move`.
 
 **Trade-off: cross-shard forced moves don't clear the flag.** If an admin moves a player who was at the OOC menu (flag=True), the player ends up IC on the destination shard via the move's ticket auth. The router-side flag remains True. On the player's next connection to the router (refresh, etc.), they land at the OOC menu and have to type `@ic` to return to the moved character. Acceptable degradation; not worth a cross-process invalidation primitive for this edge case.
 

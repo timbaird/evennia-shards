@@ -24,11 +24,12 @@ Documents about how the documentation itself is organised.
 Long-lived documents capturing the project's intent, architecture, and design rationale.
 
 - **[deployment-topology.md](deployment-topology.md)** — How a consumer game using this library is structured for development and production. The "same code, different config" property and its expression locally (terminals) and in production (platform services). Includes the four-case development phasing.
-- **[library-scope-and-mandates.md](library-scope-and-mandates.md)** — What the library provides, what it leaves to the consumer. The shipped design has no consumer-facing typeclass mandate: cross-shard movement is via the `cross_shard_character_move` primitive, and any room can be a cross-shard target without special marking.
+- **[library-scope-and-mandates.md](library-scope-and-mandates.md)** — What the library provides, what it leaves to the consumer. The shipped design has no consumer-facing typeclass mandate: cross-shard movement is via the `cross_shard_move` primitive, and any room can be a cross-shard target without special marking.
 - **[consumer-constraints.md](consumer-constraints.md)** — What the library demands of consumer games. Hard constraints rooted in the first principle that any game object exists on exactly one shard.
 - **[shard-settings.md](shard-settings.md)** — The two settings (`SHARDS_ROLE`, `SHARD_ID`), how the library reads them, the defaults, and the rule that code reading them must use the `get_role()` / `get_shard_id()` accessors rather than raw `settings.X` reads.
 - **[cross-shard-message-bus.md](cross-shard-message-bus.md)** — How shards communicate with each other: a Postgres `messages` table polled via a Twisted `LoopingCall`, with `kind`/JSONB extensibility, configurable per-kind timeouts, and a deliberate scope of "real-time inter-process messaging only — not persistent player-facing storage."
-- **[shard-isolation.md](shard-isolation.md)** — How the library enforces the partition between shards at the Django/Evennia level: four chokepoints (`from_db` override, `pre_save`/`pre_delete` signals, `QuerySet.update()` override) that together prevent cross-shard reads, writes, and deletes without a broad manager filter or idmapper modification.
+- **[tenancy.md](tenancy.md)** — How the library enforces the partition between shards at the Django/Evennia level: tenant-context-driven auto-filtering at the SQL layer via django-multitenant. Documents the installation process (`bootstrap_tenant_context()` + `install_tenancy_on_objectdb()`), the two-element tenant-list trick that gives global `"*"` rows visible from every shard, the cross-shard handoff write path (`qs.update` + in-memory sync), the `refresh_from_db` visibility guard, and the load-evict pattern for cross-shard reads.
+- **[shard-aware-search.md](shard-aware-search.md)** — The `shard_aware_global_search` helper: a substitute for `caller.search(name, global_search=True)` that escapes the multitenant auto-filter to find matches on any shard. Returns either a loaded instance (local match) or pk + shard_id metadata (foreign match) so callers can route via cross-shard primitives.
 - **[testing-setup.md](testing-setup.md)** — How unit tests are configured to run from the library root without a consumer gamedir: `tests/test_settings.py` + `runtests.py` + `BaseEvenniaTestCase`. Decouples the test suite from `examples/demo_game/`.
 
 ### Drafts (under review)
@@ -59,6 +60,7 @@ Future home of focused decision records as the design refines through implementa
 [`archive/`](archive/) holds documents that have been superseded or are no longer expected to be needed, but are retained for historical reference. Not part of the active catalogue. Move docs here rather than deleting them when they fall out of relevance.
 
 - **[archive/evennia-shards-HANDOVER.md](archive/evennia-shards-HANDOVER.md)** — The original brainstorm session that started this project. Captures the architectural sketch as first imagined: the three-mode design, the ticket-based redirect protocol, the `ShardGatewayMixin` primitive, the cache invariant, a phased PoC plan. The project's current decisions extend and refine this document; treat it as historical context, not as canonical project intent.
+- **[archive/shard-isolation.md](archive/shard-isolation.md)** — The earlier four-chokepoint isolation design (`from_db` override, `pre_save` / `pre_delete` signals, `QuerySet.update()` override, `shard_writes_allowed_for` bypass). Kept as historical context for the design choice. Live design at [tenancy.md](tenancy.md).
 
 ## Reading paths
 
@@ -85,7 +87,7 @@ Different audiences should walk through the docs in different orders. Pick the p
 ### "I want to know what's been built."
 
 1. [progress.md](progress.md) — running log of milestones with links to evidence (test results, design docs, code changes). The most current view of what's shipped.
-2. The architecture and how-it-works docs in this index — `shard-isolation.md`, `shard-settings.md`, `cross-shard-message-bus.md`, `ticket-auth-flow.md`, `library-integration-risks.md`. These were updated as features landed and reflect current behaviour.
+2. The architecture and how-it-works docs in this index — `tenancy.md`, `shard-settings.md`, `cross-shard-message-bus.md`, `ticket-auth-flow.md`, `library-integration-risks.md`. These were updated as features landed and reflect current behaviour.
 3. [`/examples/`](../examples/) — three demo gamedirs (`demo_router`, `demo_shard0`, `demo_shard1`) that exercise the library end-to-end. See [`/examples/README.md`](../examples/README.md) for the run recipe.
 
 ## Originating documents (external)

@@ -10,24 +10,53 @@ This is the architectural commitment that makes the library worth building: dive
 
 ## Local development
 
-In split mode, three terminals (one per role) run from the same game folder:
+Every role in split mode is just another `evennia start` invocation, against the **same source files** and the **same database**, with the only difference being which settings file the launcher loads. Per-role config is selected with `--settings settings_<role>` (the demo's naming convention) or equivalently by setting `DJANGO_SETTINGS_MODULE` for that one invocation. Each process is locked into its role from startup until the operator stops it.
 
-```
-Terminal 1:  cd <game folder> && DJANGO_SETTINGS_MODULE=<router settings>  evennia start
-Terminal 2:  cd <game folder> && DJANGO_SETTINGS_MODULE=<shard0 settings>  evennia start
-Terminal 3:  cd <game folder> && DJANGO_SETTINGS_MODULE=<shard1 settings>  evennia start
-```
-
-All three processes:
-- Read the same source files from the same directory.
-- Share one database (SQLite locally, configured in the base settings).
-- Run in parallel for the duration of the dev session — terminals stay open; nothing is switched between roles mid-session.
-
-`DJANGO_SETTINGS_MODULE` scopes to a single command. It tells *that specific* `evennia start` invocation which settings file to read. Each process is locked into its role from startup until the operator stops it.
+The settings file naming convention (`settings_router.py` / `settings_shard0.py` / `settings_shard1.py` plus a shared `settings_common_shard_config.py`) is *demonstrated* by the demo gamedirs, not *mandated* by the library — see [shard-settings.md](shard-settings.md#consumer-settings-cascade) for the cascade pattern.
 
 Monolith mode is just one terminal: `cd <game folder> && evennia start` with the base settings.
 
-The settings file naming convention (`settings_router.py` / `settings_shard0.py` / `settings_shard1.py` plus a shared `settings_common_shard_config.py`) is *demonstrated* by the demo gamedirs, not *mandated* by the library — see [shard-settings.md](shard-settings.md#consumer-settings-cascade) for the cascade pattern.
+**Boot order matters on a fresh database.** Evennia's `initial_setup` creates Limbo (`#2`) and the superuser character (`#1`); the tenancy install auto-stamps those rows with whichever shard is currently saving. **Boot `shard0` first** so Limbo and the superuser land with `shard_id="shard0"` — a row created under the router (which runs unscoped, so the auto-stamp is skipped) would land `shard_id=NULL` and not be a valid IC destination without backfilling.
+
+**The mechanism for running N processes locally varies by OS** because Evennia's PID-file mechanism varies by OS. The two cases are written up explicitly below; this is the canonical reference for local multi-process setup, and other docs (e.g. [shard-settings.md](shard-settings.md), [`examples/README.md`](../examples/README.md)) point back here.
+
+### Windows: same gamedir, N terminals
+
+On Windows, N processes can be started directly from the same gamedir with no setup beyond writing the per-role settings files. Boot order: shard0 first (see *Boot order* above), then the router, then any additional shards.
+
+```
+# Terminal 1 — shard0 first (claims Limbo / superuser on a fresh DB)
+cd <game folder>
+evennia start --settings settings_shard0
+
+# Terminal 2 — router
+cd <game folder>
+evennia start --settings settings_router
+
+# Terminal 3 (optional) — shard1
+cd <game folder>
+evennia start --settings settings_shard1
+```
+
+This works because Evennia's launcher gates the `--pidfile` argument it passes to `twistd` on `os.name != "nt"` (`evennia_launcher.py:529-532`). On Windows that branch is skipped entirely: `twistd` never writes `<gamedir>/server/server.pid` or `<gamedir>/server/portal.pid`, so two `evennia start` invocations from the same folder don't fight over those files.
+
+`evennia stop` on Windows uses Win32 console-group signals (`GenerateConsoleCtrlEvent`, `evennia_launcher.py:1618-1631`) rather than a PID-file lookup. The signal goes to every process spawned from the same console — which is why each role lives in its own terminal: stopping one terminal stops only the processes started from that terminal.
+
+### Unix (Linux, macOS, WSL): view gamedirs
+
+On Unix the launcher *does* pass `--pidfile=<gamedir>/server/server.pid` (and the portal equivalent) to `twistd`, and `twistd` writes the PID integer to that path on start. Two `evennia start` invocations from the same gamedir collide on those files: the second one either refuses to start (sees a stale PID) or stomps on the first's PID record. The path is hardcoded into the launcher (`evennia_launcher.py:1824-1825`) and is not settings-overridable.
+
+The workaround is **view gamedirs**: a thin directory per role that symlinks back to the canonical gamedir for code and settings, but owns its own `server/__init__.py` and `server/logs/` (so PID and log files land in per-role paths). The shared database is reached via `os.path.realpath(__file__)` in `settings_common_shard_config.py`, which resolves the symlinked conf path back to the canonical `server/` directory regardless of which view launched the process.
+
+The demo ships the recipe and the symlink commands in [`examples/README.md`](../examples/README.md). Library-shipped view-creation tooling was considered and explicitly *not* shipped — the demo's recipe is small, the Unix case is the only one that needs it, and inventing a cross-OS helper turns out to be more surface than the problem warrants (see [progress.md](progress.md) for the decision).
+
+### Shared properties (both OSes)
+
+Regardless of OS, all processes:
+
+- Read the same source files from the same directory tree.
+- Share one database (SQLite locally, configured in the base settings).
+- Run in parallel for the duration of the dev session — terminals stay open; nothing is switched between roles mid-session.
 
 ## Production deployment
 
@@ -96,7 +125,7 @@ The library was built up across four cases, each a distinct deployment shape exe
 
 1. **Monolith.** Library installed; `SHARDS_ROLE` setting exposed but defaulting to `monolith`; library is dormant; game runs as native Evennia.
 2. **Split: router + 1 shard.** Auth/web/OOC on the router; the entire IC world on the shard. Exercises the ticket-based redirect protocol end-to-end.
-3a. **Multi-shard navigation.** Two or more shards, each owning part of the IC world. Exercises the cache invariant and cross-shard handoff via the `cross_shard_character_move` primitive (atomic DB writes via the chokepoint bypass, recursive inventory move, idmapper eviction, per-session ticket redirect).
+3a. **Multi-shard navigation.** Two or more shards, each owning part of the IC world. Exercises the cache invariant and cross-shard handoff via the `cross_shard_move` primitive (atomic `qs.update` to retag the row, recursive inventory move, idmapper eviction, per-session ticket redirect).
 3b. **Multi-shard messaging.** Postgres-backed cross-shard message bus with player-facing delivery primitives (`obj_msg`, `account_msg`) and the `send_cross_shard_message` helper. Specialised consumer-level patterns (cross-shard tells, channel propagation) are deferred to `evennia_shards/contrib/`.
 
 Each case strictly builds on the previous.

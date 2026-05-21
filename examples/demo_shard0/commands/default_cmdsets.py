@@ -20,7 +20,6 @@ from commands.command import (  # TEMPORARY (spike) — delete with the commands
     CmdCreateTicketNoIp,
     CmdCreateTicketWithIp,
     CmdCreateTicketWithWrongIp,
-    CmdCrossShardMove,
     CmdTestRedirect,
 )
 
@@ -42,7 +41,6 @@ class CharacterCmdSet(default_cmds.CharacterCmdSet):
         #
         # any commands you add below will overload the default ones.
         #
-        self.add(CmdCrossShardMove())  # TEMPORARY (spike)
         self.add(CmdCreateTicketNoIp())  # TEMPORARY (spike)
         self.add(CmdCreateTicketWithIp())  # TEMPORARY (spike)
         self.add(CmdCreateTicketWithWrongIp())  # TEMPORARY (spike)

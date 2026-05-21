@@ -10,66 +10,17 @@ from evennia.commands.command import Command as BaseCommand
 # from evennia import default_cmds
 
 
-# Note: CmdShardCheck and CmdCrossShardDig were promoted to the library
-# and are now auto-installed into CharacterCmdSet by AppConfig.ready().
-# See evennia_shards/commands.py.
+# Note: CmdShardCheck and CmdCrossShardDig are auto-installed into
+# CharacterCmdSet by AppConfig.ready(). See evennia_shards/commands.py.
+# Cross-shard movement is invoked via the shard-aware @teleport
+# override (see evennia_shards/teleport.py); there is no separate
+# cross_shard_move admin command.
 
 
 # =============================================================================
 # Temporary spike commands — scaffolding from earlier spikes. Safe to delete
 # once the relevant feature is shipped or the next round of cleanup happens.
 # =============================================================================
-
-
-class CmdCrossShardMove(BaseCommand):
-    """
-    Move the caller's character across shards (test scaffolding).
-
-    Usage:
-      cross_shard_move <shard_id> <room_pk>
-
-    Calls cross_shard_character_move to move self.caller (the character the
-    admin is currently puppeting) to the room at room_pk on shard_id.
-    Reports the move result. Sessions are redirected automatically by
-    the primitive.
-
-    TEMPORARY — added for the cross_shard_move spike to drive live
-    smoke testing without the contrib CrossShardExit being in place.
-    Delete once the contrib layer or proper admin-tool surface lands.
-    """
-
-    key = "cross_shard_move"
-    locks = "cmd:perm(Developer)"
-    help_category = "Admin"
-
-    def func(self):
-        from evennia_shards import cross_shard_character_move
-
-        args = self.args.strip().split(None, 1)
-        if len(args) < 2:
-            self.caller.msg("Usage: cross_shard_move <shard_id> <room_pk>")
-            return
-        target_shard, room_pk_str = args[0], args[1]
-
-        try:
-            room_pk = int(room_pk_str)
-        except ValueError:
-            self.caller.msg(
-                f"|rroom_pk must be an integer; got {room_pk_str!r}.|n"
-            )
-            return
-
-        try:
-            result = cross_shard_character_move(self.caller, target_shard, room_pk)
-        except Exception as exc:  # noqa: BLE001
-            self.caller.msg(f"|rcross_shard_character_move failed: {exc}|n")
-            return
-
-        self.caller.msg(
-            f"|wMove complete:|n objects_moved={result.objects_moved}, "
-            f"sessions_redirected={result.sessions_redirected}, "
-            f"failures={len(result.failures)}"
-        )
 
 
 class CmdCreateTicketNoIp(BaseCommand):
